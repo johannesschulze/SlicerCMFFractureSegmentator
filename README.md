@@ -184,5 +184,5 @@ model weights:
 
 ## License
 
-Distributed under the same permissive (BSD-style) terms as 3D Slicer. See the 3D Slicer
-[license](https://github.com/Slicer/Slicer/blob/main/License.txt).
+Distributed under the same permissive (BSD-style) terms as 3D Slicer — the
+*3D Slicer Contribution and Software License Agreement*. See the [LICENSE](LICENSE) file.
