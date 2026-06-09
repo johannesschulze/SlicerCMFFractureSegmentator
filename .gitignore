@@ -1,0 +1,15 @@
+# Downloaded nnU-Net model weights (hosted on Zenodo — see README). Far too large
+# for git; fetched on demand into this folder by WeightsDownloader.
+CMFFractureSegmentatorModule/Resources/ML/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# GIMP icon source (export the PNGs instead)
+*.xcf
+
+# OS / editor cruft
+.DS_Store
+*~
+*.swp
