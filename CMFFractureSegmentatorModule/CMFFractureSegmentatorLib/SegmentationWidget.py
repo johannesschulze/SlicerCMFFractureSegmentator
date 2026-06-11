@@ -1,11 +1,12 @@
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import qt
 import slicer
 
-from .FragmentSeparationLogic import FragmentSeparationLogic
-from .Models import MODELS, ModelConfig
+from .FragmentSeparationLogic import FragmentSeparationLogic, SeparationResult
+from .Models import MODELS, ModelConfig, modelByKey
 from .Utils import addInCollapsibleLayout, createButton
 
 
@@ -28,6 +29,7 @@ class SegmentationWidget(qt.QWidget):
         self._semanticSpacing = None
         self._lastResult = None
         self._defaultMinVolumeMm3 = self.fragmentLogic.minFragmentVolumeMm3
+        self._restoring = False  # guard against writing while restoring controls
         self.isStopping = False
         self.fullInfoLogs = []
 
@@ -41,7 +43,8 @@ class SegmentationWidget(qt.QWidget):
             slicer.mrmlScene.EndImportEvent, self._onSceneEndImport)
         self._sceneCloseObserver = slicer.mrmlScene.AddObserver(
             slicer.mrmlScene.EndCloseEvent, self._onSceneEndClose)
-        self._restoreDilationFromScene()
+        self._connectParameterPersistence()
+        self._restoreParameters()
 
     def __del__(self):
         for observer in (getattr(self, "_sceneImportObserver", None),
@@ -56,6 +59,17 @@ class SegmentationWidget(qt.QWidget):
     def _buildGui(self):
         layout = qt.QVBoxLayout(self)
 
+        # --- Logo ------------------------------------------------------------
+        logoLabel = qt.QLabel()
+        logoPath = (Path(__file__).parent / ".." / "Resources" / "Icons"
+                    / "CMFFractureSegmentatorModule_wide.png").resolve()
+        pixmap = qt.QPixmap(str(logoPath))
+        if not pixmap.isNull():
+            logoLabel.setPixmap(pixmap.scaledToWidth(300, qt.Qt.SmoothTransformation))
+        logoLabel.setAlignment(qt.Qt.AlignCenter)
+        layout.addWidget(logoLabel)
+        layout.addSpacing(30)
+
         # --- Input -----------------------------------------------------------
         self.inputSelector = slicer.qMRMLNodeComboBox(self)
         self.inputSelector.nodeTypes = ["vtkMRMLScalarVolumeNode"]
@@ -64,6 +78,20 @@ class SegmentationWidget(qt.QWidget):
         self.inputSelector.showHidden = False
         self.inputSelector.setMRMLScene(slicer.mrmlScene)
         self.inputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onInputChanged)
+
+        # Output segmentation: empty selection means "create a new one on Run".
+        self.segmentationSelector = slicer.qMRMLNodeComboBox(self)
+        self.segmentationSelector.nodeTypes = ["vtkMRMLSegmentationNode"]
+        self.segmentationSelector.selectNodeUponCreation = True
+        self.segmentationSelector.addEnabled = True
+        self.segmentationSelector.removeEnabled = True
+        self.segmentationSelector.renameEnabled = True
+        self.segmentationSelector.noneEnabled = True
+        self.segmentationSelector.noneDisplay = "Create new segmentation on Run"
+        self.segmentationSelector.showHidden = False
+        self.segmentationSelector.setMRMLScene(slicer.mrmlScene)
+        self.segmentationSelector.connect("currentNodeChanged(vtkMRMLNode*)",
+                                          self._onSegmentationSelectorChanged)
 
         self.modelComboBox = qt.QComboBox(self)
         for model in MODELS:
@@ -78,6 +106,7 @@ class SegmentationWidget(qt.QWidget):
         inputLayout.addRow("Input volume:", self.inputSelector)
         inputLayout.addRow(createButton("Load volume from file...", callback=self.onLoadVolume,
                                         toolTip="Load a volume from disk into the scene."))
+        inputLayout.addRow("Segmentation:", self.segmentationSelector)
         inputLayout.addRow("Model:", self.modelComboBox)
         inputLayout.addRow("Device:", self.deviceComboBox)
         layout.addWidget(self.inputWidget)
@@ -282,12 +311,28 @@ class SegmentationWidget(qt.QWidget):
 
     # ------------------------------------------------------------- results ---
     def _loadAndDisplayResult(self):
-        segmentationNode = self.segmentationLogic.loadSegmentation()
-        segmentationNode.SetName(self._referenceVolumeNode.GetName() + "_Segmentation")
-        segmentationNode.SetReferenceImageGeometryParameterFromVolumeNode(self._referenceVolumeNode)
+        loaded = self.segmentationLogic.loadSegmentation()
+        loaded.SetReferenceImageGeometryParameterFromVolumeNode(self._referenceVolumeNode)
+
+        target = self.segmentationSelector.currentNode()
+        if target is not None and target is not loaded:
+            # Reuse the pre-selected segmentation node (keep its identity/references).
+            name = target.GetName()
+            target.Copy(loaded)
+            target.SetName(name)
+            slicer.mrmlScene.RemoveNode(loaded)
+            segmentationNode = target
+        else:
+            segmentationNode = loaded
+            segmentationNode.SetName(self._referenceVolumeNode.GetName() + "_Segmentation")
+
         if not segmentationNode.GetDisplayNode():
             segmentationNode.CreateDefaultDisplayNodes()
+        # Remember which model produced this result so a re-run is possible after reload.
+        segmentationNode.SetAttribute(self._ATTR_MODEL, self._currentModel.key)
         self._currentSegmentationNode = segmentationNode
+        # Select the result node (also persists it via the selector handler).
+        self.segmentationSelector.setCurrentNode(segmentationNode)
         self._applyModelDisplay()
         segmentationNode.SetDisplayVisibility(True)
         slicer.app.processEvents()
@@ -347,8 +392,7 @@ class SegmentationWidget(qt.QWidget):
         self._lastResult = result
         self.fragmentCountLabel.setText(
             f"{result.nFragments} (at {result.dilationMm:.2f} mm dilation)")
-        self.dilationSpinBox.setValue(result.dilationMm)
-        self._storeDilation(result.dilationMm)
+        self.dilationSpinBox.setValue(result.dilationMm)  # also persists via valueChanged
         self.separationWidget.setEnabled(True)
         self.segmentEditorButton.setEnabled(True)
         self._show3D()
@@ -386,8 +430,16 @@ class SegmentationWidget(qt.QWidget):
         return (Path(__file__).parent / ".." / "Resources" / "ML").resolve()
 
     # --------------------------------------------------- persisted parameters --
+    # State is kept in a singleton vtkMRMLScriptedModuleNode so it is stored with the
+    # scene and survives a module reload (the node is not destroyed by Reload, and a
+    # freshly created widget restores from it in __init__).
     _MODULE_NAME = "CMFFractureSegmentator"
+    _PARAM_MODEL = "Model"
+    _PARAM_DEVICE = "Device"
     _PARAM_DILATION = "LastDilationMm"
+    _PARAM_MIN_VOLUME = "MinFragmentVolumeMm3"
+    _REF_SEGMENTATION = "SegmentationNodeRef"  # node reference role (remapped on load)
+    _ATTR_MODEL = "CMFFractureSegmentator.Model"  # model key stored on the segmentation node
 
     def _moduleParameterNode(self):
         """Get-or-create a singleton scripted-module node, stored with the scene."""
@@ -401,19 +453,118 @@ class SegmentationWidget(qt.QWidget):
             node = slicer.mrmlScene.AddNode(node)
         return node
 
-    def _storeDilation(self, radiusMm: float):
-        self._moduleParameterNode().SetParameter(self._PARAM_DILATION, f"{radiusMm:.4f}")
+    def _connectParameterPersistence(self):
+        """Persist the relevant UI state to the parameter node on every change."""
+        self.modelComboBox.connect("currentIndexChanged(int)", self._onParameterChanged)
+        self.deviceComboBox.connect("currentIndexChanged(int)", self._onParameterChanged)
+        self.dilationSpinBox.connect("valueChanged(double)", self._onParameterChanged)
+        self.minVolumeSpinBox.connect("valueChanged(double)", self._onParameterChanged)
 
-    def _restoreDilationFromScene(self):
-        value = self._moduleParameterNode().GetParameter(self._PARAM_DILATION)
-        if value:
+    def _onParameterChanged(self, *_):
+        if not self._restoring:
+            self._storeParameters()
+
+    def _onSegmentationSelectorChanged(self, *_):
+        node = self.segmentationSelector.currentNode()
+        self._currentSegmentationNode = node
+        self.segmentEditorButton.setEnabled(node is not None)
+        if not self._restoring:
+            self._moduleParameterNode().SetNodeReferenceID(
+                self._REF_SEGMENTATION, node.GetID() if node else None)
+
+    def _storeParameters(self):
+        node = self._moduleParameterNode()
+        node.SetParameter(self._PARAM_MODEL, str(self.modelComboBox.currentData or ""))
+        node.SetParameter(self._PARAM_DEVICE, self.deviceComboBox.currentText)
+        node.SetParameter(self._PARAM_DILATION, f"{self.dilationSpinBox.value:.4f}")
+        node.SetParameter(self._PARAM_MIN_VOLUME, f"{self.minVolumeSpinBox.value:.4f}")
+
+    def _restoreParameters(self):
+        """Restore controls from the parameter node (after reload or scene load)."""
+        node = self._moduleParameterNode()
+        self._restoring = True
+        try:
+            modelKey = node.GetParameter(self._PARAM_MODEL)
+            if modelKey:
+                idx = self.modelComboBox.findData(modelKey)
+                if idx >= 0:
+                    self.modelComboBox.setCurrentIndex(idx)
+            device = node.GetParameter(self._PARAM_DEVICE)
+            if device:
+                idx = self.deviceComboBox.findText(device)
+                if idx >= 0:
+                    self.deviceComboBox.setCurrentIndex(idx)
+            for key, spinBox in ((self._PARAM_DILATION, self.dilationSpinBox),
+                                 (self._PARAM_MIN_VOLUME, self.minVolumeSpinBox)):
+                value = node.GetParameter(key)
+                if value:
+                    try:
+                        spinBox.setValue(float(value))
+                    except ValueError:
+                        pass
+            self.segmentationSelector.setCurrentNode(node.GetNodeReference(self._REF_SEGMENTATION))
+            self._reattachFromSegmentation()
+        finally:
+            self._restoring = False
+
+    def _reattachFromSegmentation(self):
+        """After a reload / scene load, rebuild enough state from the selected
+        segmentation to allow a fragment re-run: the model (from a node attribute),
+        the reference volume (from the segmentation's reference geometry), and the
+        previous fragment instances (from the Fragment_* segments)."""
+        segNode = self.segmentationSelector.currentNode()
+        if segNode is None:
+            return
+
+        modelKey = segNode.GetAttribute(self._ATTR_MODEL)
+        model = None
+        if modelKey:
             try:
-                self.dilationSpinBox.setValue(float(value))
-            except ValueError:
-                pass
+                model = modelByKey(modelKey)
+            except KeyError:
+                model = None
+        refVolume = segNode.GetNodeReference(
+            slicer.vtkMRMLSegmentationNode.GetReferenceImageGeometryReferenceRole())
+        if model is None or refVolume is None:
+            return  # not a result this module can re-run
+
+        self._currentModel = model
+        self._referenceVolumeNode = refVolume
+        idx = self.modelComboBox.findData(model.key)
+        if idx >= 0:
+            self.modelComboBox.setCurrentIndex(idx)
+
+        lastResult = self._rebuildLastResult(segNode, refVolume)
+        if lastResult is not None:
+            self._lastResult = lastResult
+            self.fragmentCountLabel.setText(f"{lastResult.nFragments} (restored)")
+            self.separationWidget.setEnabled(True)
+        self.segmentEditorButton.setEnabled(True)
+
+    def _rebuildLastResult(self, segNode, referenceVolume):
+        """Reconstruct the fragment instance map from the Fragment_* segments."""
+        segmentation = segNode.GetSegmentation()
+        allIds = [segmentation.GetNthSegmentID(i)
+                  for i in range(segmentation.GetNumberOfSegments())]
+        fragIds = sorted((sid for sid in allIds if sid.startswith("Fragment_")),
+                         key=lambda s: int(s.split("_")[1]))
+        if not fragIds:
+            return None
+        instances = None
+        for label, sid in enumerate(fragIds, start=1):
+            arr = slicer.util.arrayFromSegmentBinaryLabelmap(segNode, sid, referenceVolume)
+            if arr is None:
+                continue
+            if instances is None:
+                instances = np.zeros(arr.shape, dtype=np.int32)
+            instances[arr > 0] = label
+        if instances is None:
+            return None
+        return SeparationResult(instances=instances, nFragments=len(fragIds),
+                                dilationMm=self.dilationSpinBox.value)
 
     def _onSceneEndImport(self, *_):
-        self._restoreDilationFromScene()
+        self._restoreParameters()
 
     def _onSceneEndClose(self, *_):
         """Reset the module to its initial state when the scene is closed (Ctrl-W)."""
@@ -425,8 +576,13 @@ class SegmentationWidget(qt.QWidget):
         self._lastResult = None
         self.infoTextEdit.clear()
         self.fragmentCountLabel.setText("-")
-        self.dilationSpinBox.setValue(self.fragmentLogic.minDilationMm)
-        self.minVolumeSpinBox.setValue(self._defaultMinVolumeMm3)
+        self._restoring = True  # the scene (and its parameter node) is gone; just reset UI
+        try:
+            self.dilationSpinBox.setValue(self.fragmentLogic.minDilationMm)
+            self.minVolumeSpinBox.setValue(self._defaultMinVolumeMm3)
+            self.segmentationSelector.setCurrentNode(None)
+        finally:
+            self._restoring = False
         self.separationWidget.setEnabled(False)
         self.segmentEditorButton.setEnabled(False)
         self._setRunning(False)

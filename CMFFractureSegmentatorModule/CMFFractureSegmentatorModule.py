@@ -18,6 +18,7 @@ class CMFFractureSegmentatorModule(ScriptedLoadableModule):
             "Johannes Schulze (German Armed Forces Military Hospital Ulm, Germany)"
         ]
         self.parent.helpText = tr(
+            "<img src='../CMFFractureSegmentator.png' />"
             "Automatic segmentation of fractured mandibles with a dedicated nnU-Net model, "
             "followed by separation of the touching bone fragments along the segmented "
             "fracture lines."
